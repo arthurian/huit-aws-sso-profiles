@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""aws-sso-profiles: AWS CLI profiles for every IAM Identity Center account.
+
+Helper that runs the `aws sso` commands in README.md. Standard library only.
+Requires AWS CLI v2 on PATH.
+
+Commands:
+  setup     add the sso-session, log in, add a profile per account
+  list      show every account and role you can access
+  generate  print profile blocks to stdout, change nothing
+  verify    call sts get-caller-identity on every profile of the session
+
+Environment:
+  AWS_CONFIG_FILE   config file to edit (default: ~/.aws/config)
+"""
+import argparse
+import configparser
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_SESSION = "huit"
+DEFAULT_START_URL = "https://huitprodpayer.awsapps.com/start"
+SSO_REGION = "us-east-1"
+DEFAULT_ROLES = "HUITDevOpsAdmin,HUITGenAdmin,HUITPowerUser,HUITReadOnly"
+CONFIG = Path(os.environ.get("AWS_CONFIG_FILE", Path.home() / ".aws/config")).expanduser()
+TOKEN_CACHE = Path.home() / ".aws/sso/cache"
+
+# AWS_PROFILE can name a profile that the config does not have. The CLI loads
+# that profile even for `aws sso` commands and fails, so leave it out.
+AWS_ENV = {k: v for k, v in os.environ.items() if k not in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE")}
+
+
+def aws_json(*command):
+    """Run an aws CLI command and return its JSON output."""
+    result = subprocess.run(
+        ["aws", *command, "--output", "json"],
+        env=AWS_ENV, check=True, stdout=subprocess.PIPE, text=True,
+    )
+    return json.loads(result.stdout)
+
+
+# ---------- config file ----------
+
+def read_config():
+    config = configparser.ConfigParser(interpolation=None, strict=False)
+    config.read(CONFIG)
+    return config
+
+
+def append_config(text):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    with CONFIG.open("a") as f:
+        f.write(text)
+
+
+def profile_section(name):
+    """The config section header for a profile name."""
+    return "default" if name == "default" else f"profile {name}"
+
+
+def session_profiles(session, config):
+    """{profile_name: section} for every profile that uses this sso-session."""
+    profiles = {}
+    for section in config.sections():
+        if section == "default" or section.startswith("profile "):
+            if config[section].get("sso_session") == session:
+                profiles[section.removeprefix("profile ")] = config[section]
+    return profiles
+
+
+def session_flag(session):
+    """The `-s NAME` to show in hints, or nothing for the default session."""
+    return "" if session == DEFAULT_SESSION else f" -s {session}"
+
+
+def add_session_if_missing(args):
+    """Add the [sso-session] block (README step 1). Only `setup` calls this."""
+    section = f"sso-session {args.session}"
+    config = read_config()
+    if config.has_section(section):
+        url = config[section]["sso_start_url"]
+        if args.start_url and args.start_url != url:
+            sys.exit(f"error: [{section}] already uses {url}. Use -s to name a new session.")
+        return
+    if not args.start_url:
+        if args.session != DEFAULT_SESSION:
+            sys.exit(f"error: the new session '{args.session}' needs --start-url")
+        args.start_url = DEFAULT_START_URL
+    append_config(
+        f"\n[{section}]\n"
+        f"sso_start_url = {args.start_url}\n"
+        f"sso_region = {args.sso_region}\n"
+        "sso_registration_scopes = sso:account:access\n"
+    )
+    print(f"Added [{section}] -> {args.start_url} ({args.sso_region})", file=sys.stderr)
+
+
+def session_region(session):
+    """The sso_region of the [sso-session] block. Exit if the block is missing."""
+    section = f"sso-session {session}"
+    config = read_config()
+    if not config.has_section(section):
+        sys.exit(f"error: no [{section}] in {CONFIG}. Run `aws-sso-profiles setup{session_flag(session)}` first, or see README step 1.")
+    return config[section]["sso_region"]
+
+
+# ---------- login ----------
+
+def cached_token(session):
+    """The access token that `aws sso login` cached, or None if missing or expired."""
+    cache_file = TOKEN_CACHE / (hashlib.sha1(session.encode()).hexdigest() + ".json")
+    if not cache_file.exists():
+        return None
+    cache = json.loads(cache_file.read_text())
+    expires = datetime.fromisoformat(cache["expiresAt"].replace("Z", "+00:00"))
+    if expires <= datetime.now(timezone.utc):
+        return None
+    return cache["accessToken"]
+
+
+def login(session):
+    """Return a valid access token. Run `aws sso login` first if needed."""
+    token = cached_token(session)
+    if token is None:
+        subprocess.run(["aws", "sso", "login", "--sso-session", session], env=AWS_ENV, check=True)
+        token = cached_token(session)
+    if token is None:
+        sys.exit("error: login did not produce a usable token")
+    return token
+
+
+# ---------- accounts and profiles ----------
+
+def account_roles(args):
+    """[(account_id, account_name, [role, ...])], sorted by account name."""
+    sso = ["--access-token", args.token, "--region", args.sso_region]
+    accounts = aws_json("sso", "list-accounts", *sso)["accountList"]
+    accounts.sort(key=lambda account: account["accountName"].lower())
+
+    def roles_for(account):
+        roles = aws_json("sso", "list-account-roles", *sso, "--account-id", account["accountId"])["roleList"]
+        return sorted(role["roleName"] for role in roles)
+
+    # One CLI call per account. Run them in parallel because each takes about a second.
+    with ThreadPoolExecutor(16) as pool:
+        roles_per_account = list(pool.map(roles_for, accounts))
+    return [
+        (account["accountId"], account["accountName"], roles)
+        for account, roles in zip(accounts, roles_per_account)
+    ]
+
+
+def slug(text):
+    """'Example DEV' -> 'example-dev'"""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def plan(args):
+    """[(profile_name, account_id, role, account_name)] for every account (and role)."""
+    rows = []
+    used_names = set()
+    for account_id, account_name, roles in account_roles(args):
+        name = args.prefix + (slug(account_name) or f"account-{account_id}")
+        if name in used_names:  # two accounts with the same name
+            name = f"{name}-{account_id}"
+        used_names.add(name)
+
+        if args.all_roles:
+            for role in roles:
+                rows.append((f"{name}-{slug(role)}", account_id, role, account_name))
+        elif roles:
+            preferred = [role for role in args.roles.split(",") if role in roles]
+            role = preferred[0] if preferred else roles[0]
+            rows.append((name, account_id, role, account_name))
+    return rows
+
+
+def profile_block(args, name, account_id, role):
+    return (
+        f"[{profile_section(name)}]\n"
+        f"sso_session = {args.session}\n"
+        f"sso_account_id = {account_id}\n"
+        f"sso_role_name = {role}\n"
+        f"region = {args.region or args.sso_region}\n"
+    )
+
+
+# ---------- commands ----------
+
+def cmd_list(args):
+    for account_id, account_name, roles in account_roles(args):
+        for role in roles:
+            print(f"{account_id:<14} {account_name:<40} {role}")
+
+
+def cmd_generate(args):
+    for name, account_id, role, account_name in plan(args):
+        print(f"\n# {account_name}")
+        print(profile_block(args, name, account_id, role), end="")
+
+
+def caller_identity(profile):
+    return subprocess.run(
+        ["aws", "sts", "get-caller-identity", "--profile", profile, "--query", "Arn", "--output", "text"],
+        env=AWS_ENV, capture_output=True, text=True,
+    )
+
+
+def cmd_verify(args):
+    profiles = sorted(session_profiles(args.session, read_config()))
+    with ThreadPoolExecutor(8) as pool:
+        results = list(pool.map(caller_identity, profiles))
+
+    failed = 0
+    for profile, result in zip(profiles, results):
+        if result.returncode == 0:
+            print(f"  ok    {profile:<40} {result.stdout.strip()}")
+        else:
+            failed += 1
+            error = (result.stderr or result.stdout).strip().splitlines()
+            print(f"  FAIL  {profile:<40} {error[-1] if error else ''}")
+    print(f"\n  {len(profiles) - failed} ok, {failed} failed")
+    return 1 if failed else 0
+
+
+def cmd_setup(args):
+    config = read_config()
+
+    def name_taken(name):
+        return config.has_section(profile_section(name))
+
+    existing = {}  # (account_id, role) -> profile name
+    for name, section in session_profiles(args.session, config).items():
+        if "sso_account_id" in section and "sso_role_name" in section:
+            existing[(section["sso_account_id"], section["sso_role_name"])] = name
+
+    print(f"Reading accounts and roles from {args.session}...", file=sys.stderr)
+    new_blocks = []
+    for name, account_id, role, _ in plan(args):
+        if (account_id, role) in existing:
+            action, name = "exists", existing[(account_id, role)]
+        elif name_taken(name):
+            action = "skip"  # another profile already uses this name
+        else:
+            action = "add"
+            new_blocks.append(profile_block(args, name, account_id, role))
+        note = "  (name already in use)" if action == "skip" else ""
+        print(f"  {action:<7} {name:<40} {account_id}  {role}{note}", file=sys.stderr)
+
+    if not new_blocks:
+        print("Nothing to change.", file=sys.stderr)
+    else:
+        if not args.yes:
+            answer = input(f"Apply {len(new_blocks)} new profile(s) to {CONFIG}? [y/N] ")
+            if not answer.lower().startswith("y"):
+                sys.exit("Aborted; no profiles written.")
+        header = f"\n# --- aws-sso-profiles: sso-session {args.session} ({time.strftime('%Y-%m-%d')}) ---\n"
+        append_config(header + "".join("\n" + block for block in new_blocks))
+        print(f"Wrote {len(new_blocks)} profile(s) to {CONFIG}.", file=sys.stderr)
+    print(f"Log in each day with: aws sso login --sso-session {args.session}", file=sys.stderr)
+    print(f"Test the profiles with: aws-sso-profiles verify{session_flag(args.session)}", file=sys.stderr)
+
+
+COMMANDS = {
+    "setup": cmd_setup,
+    "list": cmd_list,
+    "generate": cmd_generate,
+    "verify": cmd_verify,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command", nargs="?", choices=COMMANDS)
+    parser.add_argument("-s", "--session", default=DEFAULT_SESSION, help="sso-session name (default: %(default)s)")
+    parser.add_argument("-u", "--start-url", help=f"portal URL for a new sso-session (default for {DEFAULT_SESSION}: {DEFAULT_START_URL})")
+    parser.add_argument("-r", "--sso-region", default=SSO_REGION, help="region for a new sso-session (default: %(default)s)")
+    parser.add_argument("--region", help="region written into each profile (default: sso region)")
+    parser.add_argument("-p", "--prefix", default="", help="prepend PREFIX to every new profile name")
+    parser.add_argument("--roles", default=DEFAULT_ROLES, help="comma list of role names, most preferred first (default: %(default)s)")
+    parser.add_argument("--all-roles", action="store_true", help="one profile per account+role (<account>-<role>)")
+    parser.add_argument("-y", "--yes", action="store_true", help="apply without asking")
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        sys.exit()
+
+    if args.command == "setup":
+        add_session_if_missing(args)
+    args.sso_region = session_region(args.session)
+    try:
+        args.token = login(args.session)
+        sys.exit(COMMANDS[args.command](args))
+    except subprocess.CalledProcessError:
+        sys.exit(f"error: an aws command failed (see above). Try: aws sso login --sso-session {args.session}")
+
+
+if __name__ == "__main__":
+    main()
