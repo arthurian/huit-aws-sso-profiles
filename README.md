@@ -106,6 +106,8 @@ Check which account and role the current profile uses, before you run a command 
 alias awsw='aws sts get-caller-identity --query Arn --output text'
 ```
 
+If you use [Oh My Zsh](https://github.com/ohmyzsh/ohmyzsh), its [aws plugin](https://github.com/ohmyzsh/ohmyzsh/tree/master/plugins/aws) gives similar commands. `asp example-dev` sets `AWS_PROFILE` and tab-completes the profile names. `asp example-dev login` also runs `aws sso login` every time, with or without a valid login session. The plugin can also show the current profile and region in your prompt. The plugin does not conflict with the snippets above, so you can use both.
+
 ## The plain AWS CLI commands
 
 The examples use the Harvard HUIT portal. Change the session name, start URL, and region for your portal.
